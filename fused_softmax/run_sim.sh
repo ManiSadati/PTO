@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Direct A5 camodel run for the softmax CCE kernel.
+# Direct A5 camodel run for the fused softmax CCE kernel.
 #
 # This follows the local PTO/TileLang ST pattern:
 #   1. Build the CCE kernel + launch wrapper into a fatobj-linked shared lib.
@@ -9,7 +9,7 @@ set -euo pipefail
 #   3. Run the host directly, without msprof/opprof.
 #
 # Usage:
-#   bash -ic 'activate_ptoas >/dev/null; cd ~/mani-PTO/cce; bash run_sim.sh'
+#   bash -ic 'activate_ptoas >/dev/null; cd ~/mani-PTO/fused_softmax; bash run_sim.sh'
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build}"
@@ -126,7 +126,7 @@ echo "==> [4/4] Running direct camodel verifier"
 )
 
 echo
-echo "Softmax camodel workflow completed successfully."
+echo "Fused softmax camodel workflow completed successfully."
 echo "  Kernel shared library: $KERNEL_SO"
 echo "  Host executable: $HOST_EXE"
 echo "  Input: $INPUT_BIN"

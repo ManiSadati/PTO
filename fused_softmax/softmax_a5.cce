@@ -1,0 +1,225 @@
+// Fixed kernel geometry: 8 vector blocks, each containing two independent
+// softmax groups of length 1024.
+constexpr uint32_t SOFTMAX_BLOCKS = 8;
+constexpr uint32_t SOFTMAX_GROUPS_PER_BLOCK = 2;
+constexpr uint32_t SOFTMAX_LENGTH = 1024;
+constexpr uint32_t SOFTMAX_ELEMENTS_PER_BLOCK =
+    SOFTMAX_GROUPS_PER_BLOCK * SOFTMAX_LENGTH;
+
+// The DMA is tiled as 16 contiguous rows of 128 FP16 elements. This is only a
+// copy geometry; it does not define the softmax axis.
+constexpr uint32_t DMA_ROWS_PER_BLOCK = 16;
+constexpr uint32_t DMA_ROW_ELEMENTS = 128;
+constexpr uint32_t HALF_BYTES = sizeof(half);
+constexpr uint32_t DMA_ROW_BYTES = DMA_ROW_ELEMENTS * HALF_BYTES;
+constexpr uint32_t DMA_BLOCK_BYTES = 32;
+
+static_assert(SOFTMAX_ELEMENTS_PER_BLOCK == 2048);
+static_assert(DMA_ROWS_PER_BLOCK * DMA_ROW_ELEMENTS ==
+              SOFTMAX_ELEMENTS_PER_BLOCK);
+static_assert(DMA_ROW_BYTES == 256);
+static_assert(DMA_ROW_BYTES % DMA_BLOCK_BYTES == 0);
+
+// Fused UB layout. The online max/sum pass keeps only two scalar tensors in UB;
+// the old broadcast/sub/exp/broadcast-sum scratch tensors are intentionally gone.
+constexpr uint32_t UB_DATA_OFFSET = 0;          // 4096 B, FP16
+constexpr uint32_t UB_REDUCE_MAX_OFFSET = 4096; // 2 FP16 values
+constexpr uint32_t UB_REDUCE_SUM_OFFSET = 4128; // 2 FP32 values
+constexpr uint32_t UB_OUTPUT_OFFSET = 8192;     // 4096 B, FP16
+
+[aicore] inline void CopySoftmaxBlockGmToUb(__ubuf__ half *dst,
+                                             __gm__ half *src) {
+  copy_gm_to_ubuf_align_v2(
+      reinterpret_cast<__ubuf__ uint16_t *>(dst),
+      reinterpret_cast<__gm__ uint16_t *>(src), 0, DMA_ROWS_PER_BLOCK,
+      DMA_ROW_BYTES, 0, 0, false, 0, DMA_ROW_BYTES, DMA_ROW_BYTES);
+}
+
+[aicore] inline void CopySoftmaxBlockUbToGm(__gm__ half *dst,
+                                             __ubuf__ half *src) {
+  copy_ubuf_to_gm_align_v2(
+      reinterpret_cast<__gm__ uint16_t *>(dst),
+      reinterpret_cast<__ubuf__ uint16_t *>(src), 0, DMA_ROWS_PER_BLOCK,
+      DMA_ROW_BYTES, 0, DMA_ROW_BYTES, DMA_ROW_BYTES);
+}
+
+__attribute__((always_inline)) inline
+    [aicore] void
+    vf_wrapper_softmax_0(__ubuf__ void *reduce_0_local_UB,
+                         __ubuf__ void *data_local_UB,
+                         __ubuf__ void *reduce_1_local_UB,
+                         __ubuf__ void *cast_1_local_UB) {
+      __VEC_SCOPE__ {
+        vector_bool predicate_reg_0;
+        predicate_reg_0 = pge_b8(PAT_ALL);
+
+        // Pass 1: online row max + denominator.
+        //
+        // For each 64-element chunk:
+        //   new_mx = max(old_mx, max(x))
+        //   sum = sum * exp(old_mx - new_mx) + sum(exp(x - new_mx))
+        //
+        // Only final scalar max/sum values are written to UB.
+        for (uint16_t i0_c = 0; i0_c < 2; ++i0_c) {
+          vector_f16 vector_reg_0; // running max, broadcast in FP16
+          vdup(vector_reg_0, (half)-6.550400e+04f, predicate_reg_0,
+               MODE_ZEROING);
+          vector_f32 vector_reg_1; // running sum, broadcast in FP32
+          vdup(vector_reg_1, 0.0000000000000000e+00f, predicate_reg_0,
+               MODE_ZEROING);
+
+          for (uint16_t k1_o = 0; k1_o < 16; ++k1_o) {
+            vector_address address_reg_0 = vag_b16((int16_t)1024, (int16_t)64);
+
+            vector_f16 vector_reg_2;
+            vld(vector_reg_2, ((__ubuf__ half *)data_local_UB), address_reg_0,
+                UNPK_B16);
+
+            vector_f16 vector_reg_3;
+            vcmax(vector_reg_3, vector_reg_2, predicate_reg_0, MODE_ZEROING);
+
+            vector_f16 vector_reg_4;
+            vmax(vector_reg_4, vector_reg_0, vector_reg_3, predicate_reg_0,
+                 MODE_ZEROING);
+
+            vector_f16 vector_reg_5;
+            vdup(vector_reg_5, vector_reg_4, predicate_reg_0, POS_LOWEST,
+                 MODE_ZEROING);
+
+            vector_f16 vector_reg_6;
+            vsub(vector_reg_6, vector_reg_0, vector_reg_5, predicate_reg_0,
+                 MODE_ZEROING);
+
+            vector_f32 vector_reg_7;
+            vcvt(vector_reg_7, vector_reg_6, predicate_reg_0, PART_EVEN);
+
+            vector_f32 vector_reg_8;
+            vexp(vector_reg_8, vector_reg_7, predicate_reg_0, MODE_ZEROING);
+
+            vector_f16 vector_reg_9;
+            vsub(vector_reg_9, vector_reg_2, vector_reg_5, predicate_reg_0,
+                 MODE_ZEROING);
+
+            vector_f32 vector_reg_10;
+            vcvt(vector_reg_10, vector_reg_9, predicate_reg_0, PART_EVEN);
+
+            vector_f32 vector_reg_11;
+            vexp(vector_reg_11, vector_reg_10, predicate_reg_0, MODE_ZEROING);
+
+            vector_f32 vector_reg_12;
+            vcadd(vector_reg_12, vector_reg_11, predicate_reg_0, MODE_ZEROING);
+
+            vector_f32 vector_reg_13;
+            vmul(vector_reg_13, vector_reg_1, vector_reg_8, predicate_reg_0,
+                 MODE_ZEROING);
+
+            vadd(vector_reg_1, vector_reg_13, vector_reg_12, predicate_reg_0,
+                 MODE_ZEROING);
+            vdup(vector_reg_1, vector_reg_1, predicate_reg_0, POS_LOWEST,
+                 MODE_ZEROING);
+            vdup(vector_reg_0, vector_reg_4, predicate_reg_0, POS_LOWEST,
+                 MODE_ZEROING);
+          }
+
+          vector_address address_reg_1 = vag_b16((int16_t)1);
+          vst(vector_reg_0, ((__ubuf__ half *)reduce_0_local_UB), address_reg_1,
+              ONEPT_B16, predicate_reg_0);
+
+          vector_address address_reg_2 = vag_b32((int16_t)1);
+          vst(vector_reg_1, ((__ubuf__ float *)reduce_1_local_UB), address_reg_2,
+              ONEPT_B32, predicate_reg_0);
+        }
+
+        mem_bar(VST_VLD);
+
+        // Pass 2: emit final softmax using the final online max/sum scalars.
+        for (uint16_t i0_c1 = 0; i0_c1 < 2; ++i0_c1) {
+          vector_address address_reg_3 = vag_b16((int16_t)1);
+          vector_address address_reg_4 = vag_b32((int16_t)1);
+
+          vector_f16 vector_reg_14;
+          vld(vector_reg_14, ((__ubuf__ half *)reduce_0_local_UB),
+              address_reg_3, BRC_B16);
+          vector_f16 vector_reg_15;
+          vdup(vector_reg_15, vector_reg_14, predicate_reg_0, POS_LOWEST,
+               MODE_ZEROING);
+
+          vector_f32 vector_reg_16;
+          vld(vector_reg_16, ((__ubuf__ float *)reduce_1_local_UB),
+              address_reg_4, BRC_B32);
+          vector_f32 vector_reg_17;
+          vdup(vector_reg_17, vector_reg_16, predicate_reg_0, POS_LOWEST,
+               MODE_ZEROING);
+
+          for (uint16_t k1_o1 = 0; k1_o1 < 16; ++k1_o1) {
+            vector_address address_reg_5 = vag_b16((int16_t)1024, (int16_t)64);
+            vector_f16 vector_reg_18;
+            vld(vector_reg_18, ((__ubuf__ half *)data_local_UB),
+                address_reg_5, UNPK_B16);
+
+            vector_f16 vector_reg_19;
+            vsub(vector_reg_19, vector_reg_18, vector_reg_15, predicate_reg_0,
+                 MODE_ZEROING);
+
+            vector_f32 vector_reg_20;
+            vcvt(vector_reg_20, vector_reg_19, predicate_reg_0, PART_EVEN);
+
+            vector_f32 vector_reg_21;
+            vexp(vector_reg_21, vector_reg_20, predicate_reg_0, MODE_ZEROING);
+
+            vector_f32 vector_reg_22;
+            vdiv(vector_reg_22, vector_reg_21, vector_reg_17, predicate_reg_0,
+                 MODE_ZEROING);
+
+            vector_f16 vector_reg_23;
+            vcvt(vector_reg_23, vector_reg_22, predicate_reg_0, ROUND_R,
+                 RS_DISABLE, PART_EVEN);
+
+            vst(vector_reg_23, ((__ubuf__ half *)cast_1_local_UB),
+                address_reg_5, PK_B32, predicate_reg_0);
+          }
+        }
+      }
+    }
+
+#ifdef __CCE_KT_TEST__
+#define __aicore__
+#else
+#define __aicore__ [aicore]
+#endif
+
+extern "C" __global__ __aicore__
+    void softmax__kernel0(__gm__ half *__restrict__ data,
+                          __gm__ half *__restrict__ cast_1) {
+  // "aicore arch: Ascend320"
+  const uint32_t blockIdx = get_block_idx();
+  if (blockIdx < SOFTMAX_BLOCKS) {
+    __ubuf__ half *data_local_UB =
+        (__ubuf__ half *)get_imm(UB_DATA_OFFSET);
+    __ubuf__ half *reduce_0_local_UB =
+        (__ubuf__ half *)get_imm(UB_REDUCE_MAX_OFFSET);
+    __ubuf__ float *reduce_1_local_UB =
+        (__ubuf__ float *)get_imm(UB_REDUCE_SUM_OFFSET);
+    __ubuf__ half *cast_1_local_UB =
+        (__ubuf__ half *)get_imm(UB_OUTPUT_OFFSET);
+
+    const uint32_t blockOffset = blockIdx * SOFTMAX_ELEMENTS_PER_BLOCK;
+
+    CopySoftmaxBlockGmToUb(data_local_UB, data + blockOffset);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+    vf_wrapper_softmax_0(
+        ((__ubuf__ half *)reduce_0_local_UB), ((__ubuf__ half *)data_local_UB),
+        ((__ubuf__ float *)reduce_1_local_UB),
+        ((__ubuf__ half *)cast_1_local_UB));
+
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    CopySoftmaxBlockUbToGm(cast_1 + blockOffset, cast_1_local_UB);
+
+    // Ensure the GM write has completed before this block exits.
+    pipe_barrier(PIPE_ALL);
+  }
+  pipe_barrier(PIPE_ALL);
+}
