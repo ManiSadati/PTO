@@ -1,1 +1,10 @@
 build/
+
+# A5 camodel dumps/logs can be emitted into the process cwd.
+core*.dump
+core*_summary_log
+core*.log
+profile_*_log*.toml
+stars_log*.dump
+*.log.dump
+*_perf_summary_log
